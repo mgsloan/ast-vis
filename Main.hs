@@ -1,104 +1,120 @@
-{-# LANGUAGE FlexibleInstances, TupleSections #-}
+{-# LANGUAGE FlexibleInstances, TemplateHaskell, 
+             TupleSections, TypeOperators #-}
 
-import Control.Monad (liftM, zipWithM)
 import Control.Arrow ((&&&), first)
-
+import Control.Monad (liftM, zipWithM_)
+import Data.Curve
+import Data.Curve.Util (zipT)
+import Data.Data
+import Data.Either
+import Data.Function (on)
+import Data.Generics.Aliases
+import Data.Label
+import Data.List (groupBy, partition)
+import Data.Maybe
+import Graphics.ToyFramework
 import Language.Haskell.Exts.Annotated
+import qualified Data.Curve.Interval as I
 import qualified Graphics.Rendering.Cairo as C
 
-import Data.Curve
-import qualified Data.Curve.Interval as I
+data State = State
+  { _code :: String
+  , _cursor :: Int
+  , _parsed :: (ParseResult (Decl SrcSpanInfo))
+  , _mouseCursor :: (Double, Double)
+  }
 
-import Graphics.ToyFramework
+$(mkLabels [''State])
 
-import Data.Maybe
-import Data.Either
-import Data.List (groupBy)
-import Data.Function (on)
+modM :: Monad m => (b :-> a) -> (a -> a) -> b -> m b
+modM l f = return . modify l f
 
-import Data.Data
-import Data.Generics.Aliases
+setM :: Monad m => (b :-> a) -> a -> b -> m b
+setM l x = return . set l x
+
+lensed :: (f :-> a) -> (f :-> a') -> (a -> a') -> f -> f
+lensed l l' f s = set l' (f $ get l s) s
+
+updateParse :: State -> State
+updateParse = lensed code parsed parseDecl
 
 main = runToy $ Toy
-  { initialState = State "f = a . b . c $ 4 * 2 + 1" 0
-      (ParseFailed (SrcLoc "" 0 0)  "")
-      (0, 220)
-  , mouse   = handleMouse
+  { initialState = updateParse $ 
+      State "fibs = 0 : 1 : zipWith (+) fibs (tail fibs)" 0 undefined (0, 220)
+  , mouse   = const $ setM mouseCursor
   , key     = handleKey
   , display = handleDisplay
   , tick    = const return
   }
 
-handleMouse :: Maybe (Bool, Int) -> DPoint -> State -> IO State
-handleMouse _ d (State a b c _) = return $ State a b c d
-
-updateParse (State str ix _ m) = State str ix (parseDecl str) m
-
 handleKey :: Either [Char] Char -> Bool -> State -> IO State
-handleKey (Right k) True (State x ix p m) =
-  return . updateParse $ State (insIx [k] ix x) (ix + 1) p m
+handleKey (Right k) True (State xs ix p m) =
+  return . updateParse $ State (pre ++ (k : post)) (ix + 1) p m
+ where 
+  (pre, post) = splitAt ix xs
 
-handleKey (Left k) True s@(State x ix p m) = liftM updateParse $ (case k of
-    "Left"  -> modIx (max 0 . subtract 1)
-    "Right" -> modIx (min endPos . (+1))
-    "Home"  -> modIx (const 0)
-    "End"   -> modIx (const endPos)
-    "BackSpace" -> return $ State (delIx (ix - 1) x) (max 0 (ix - 1)) p m
-    "Delete" -> return $ State (delIx ix x) ix p m
-    "Escape" -> error "User escape"
-    _ -> return s)
-  where modIx f = return $ State x (f ix) p m
-        endPos = length x
+handleKey (Left k) True s@(State xs ix p m) = liftM updateParse $ (case k of
+    "Left"  -> modM cursor (max 0 . subtract 1)
+    "Right" -> modM cursor (min endPos . (+1))
+    "Home"  -> setM cursor 0
+    "End"   -> setM cursor endPos
+    "BackSpace" -> const (return $ State (delIx (ix - 1)) (max 0 (ix - 1)) p m)
+    "Delete" -> setM code (delIx ix)
+    "Escape" -> const $ error "User escape"
+    _ -> return) s
+  where endPos = length xs
+        delIx i | (pre, (_:post)) <- splitAt i xs = pre ++ post
+                | otherwise = xs
 
 handleKey _ _ s = return s
 
-
 handleDisplay :: IPnt -> IRect -> State -> C.Render State
-handleDisplay _ (tl, br) s@(State xs ix p m) = do
-  C.moveTo 10 200
-  C.showText xs
-  (textRect (10.0, 200.0) xs 0 ix) >>= draw . rside 1
+handleDisplay _ (tl, br) s@(State txt ix p (_, ypos)) = do
+  let textPos = (50.5, 100.5)
+      height = (fromIntegral . snd $ br ^-^ tl) * 0.5
+      astPos = textPos ^+^ (0.0, ypos - height)
+
+  move textPos
+  C.showText txt
+
+  -- Draw the mouse cursor.
+  C.setLineWidth 1
+  draw . offset (textPos ^+^ (-1, 0)) . rside 1 . expandR 2 =<< textRect txt 0 ix 
   C.stroke
   
-  C.moveTo 10 150
   case p of
-    ParseOk x -> (toSegs ((10.0, snd m - fromIntegral height * 0.5))
-               . process . rights . catMaybes $ glines 0 x)
-             >>= mapM_ draw
+    ParseOk decl -> drawParse astPos txt decl
     f@(ParseFailed _ _) -> C.showText (show f)
   C.stroke
 
   return s
- where
-  process = map last . groupBy ((==) `on` (\(x,_,_)->x))
-  toSegs p = zipWithM (\d ((f, t), _, txt) ->
-               liftM ((txt,) . rside 0 . first (I.expand 2)) $
-               textRect (p ^+^ ((0,15) ^* (fromIntegral d))) xs (f-1) (t-1)) [1..]
-  height = snd $ br ^-^ tl
-data State = State String Int (ParseResult (Decl SrcSpanInfo)) (Double, Double)
 
-srcSpan = (srcSpanStartColumn &&& srcSpanEndColumn) . srcInfoSpan
+drawLabeledLine txt lin = do
+  draw lin
+  relText 0.5 (lin `at` 0.5 ^-^ (0, 7)) txt
 
-glines :: (Data a) => Int -> a -> [Maybe (Either (Int, Int) ((Int, Int), Int, String))]
-glines depth = (\t -> (\xs -> helper (show $ toConstr t) xs : xs)
-                      . concat . gmapQ (glines $ depth + 1) $ t)
-        `extQ` (single . Just . Left . srcSpan)
-  where helper name xs = (listToMaybe . lefts $ catMaybes xs) >>=
-                         return . Right . (, depth, name)
+drawParse pos txt decl =
+      -- Draw each labeled line, each subsequent line 15 pixels lower.
+  zipWithM_ (\d (lin, name) -> drawLabeledLine name . (`offset` lin)
+                             $ pos ^+^ (0, 15) ^* fromIntegral d)
+            [0..]
 
--- Util
-single x = [x]
-insIx v i xs = pre ++ v ++ post
-  where (pre, post) = splitAt i xs
-delIx i xs | (pre, (_:post)) <- splitAt i xs = pre ++ post
-           | otherwise = xs
+      -- Turn each span into an appropriately sized line segment.
+  =<< ( mapM (\((f,t), name) -> liftM ((, name) . rside 2 . expandR 2)
+                              $ textRect txt (f - 1) (t - 1))
 
-instance Draw (String, DLine) where
-  draw (txt, x) = draw x >> move (x `at` 0.5) >> C.showText txt
+      -- Prefer last of all identically-spanned tokens.  Pretty arbitrary.
+      . map last . groupBy ((==) `on` (\(x,_)->x))
 
-textRect :: DPoint -> String -> Int -> Int -> C.Render DRect
-textRect (x, y) txt f t | t >= f = do
-  (C.TextExtents _ _ _ _ w1 _) <- C.textExtents pre
-  (C.TextExtents _ _ _ _ w2 _) <- C.textExtents (take (t - f) post)
-  return $ (x + w1 + 2 I.... x + w1 + w2, y - 10 I.... y + 2)
- where (pre, post) = splitAt f txt
+      -- Extract the labeled spans from the AST.
+      . snd $ getSpans decl)
+ 
+srcSpan :: SrcSpanInfo -> (Int, Int)
+srcSpan = (srcSpanStartColumn &&& srcSpanEndColumn) .  srcInfoSpan
+
+getSpan :: (Data a) => a -> Maybe (Int, Int)
+getSpan = listToMaybe . catMaybes . gmapQ (const Nothing `extQ` (Just . srcSpan))
+
+getSpans :: (Data a) => a -> [((Int, Int), String)]
+getSpans x = maybeToList (return . (, show $ toConstr x) =<< getSpan x)
+          ++ concat (gmapQ getSpans x)
