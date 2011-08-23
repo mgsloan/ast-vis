@@ -38,6 +38,7 @@ lensed l l' f s = set l' (f $ get l s) s
 updateParse :: State -> State
 updateParse = lensed code parsed parseDecl
 
+main :: IO ()
 main = runToy $ Toy
   { initialState = updateParse $ 
       State "fibs = 0 : 1 : zipWith (+) fibs (tail fibs)" 0 undefined (0, 220)
@@ -83,32 +84,33 @@ handleDisplay _ (tl, br) s@(State txt ix p (_, ypos)) = do
   C.stroke
   
   case p of
-    ParseOk decl -> drawParse astPos txt decl
+    ParseOk decl -> drawSpans astPos txt (getSpans decl)
     f@(ParseFailed _ _) -> C.showText (show f)
   C.stroke
 
   return s
 
+spanLine :: String -> (Int, Int) -> C.Render (Linear Double, Linear Double)
+spanLine txt (f, t) = liftM (rside 2 . expandR 2) $ textRect txt f (t - 1)
+
+drawLabeledLine :: String -> DLine -> C.Render ()
 drawLabeledLine txt lin = do
   draw lin
   relText 0.5 (lin `at` 0.5 ^-^ (0, 7)) txt
 
-drawParse pos txt decl =
-      -- Draw each labeled line, each subsequent line 15 pixels lower.
-  zipWithM_ (\d (lin, name) -> drawLabeledLine name . (`offset` lin)
-                             $ pos ^+^ (0, 15) ^* fromIntegral d)
-            [0..]
+drawSpans :: DPoint  -> String -> [((Int, Int), String)] -> C.Render ()
+drawSpans pos txt =
+      -- Draw each labeled line, with each subsequent line 15 pixels lower.
+  (>>= zipWithM_ (\d (l, n) -> drawLabeledLine n
+                             $ offset (pos ^+^ (0, 15) ^* fromIntegral d) l)
+                 [0..])
 
       -- Turn each span into an appropriately sized line segment.
-  =<< ( mapM (\((f,t), name) -> liftM ((, name) . rside 2 . expandR 2)
-                              $ textRect txt (f - 1) (t - 1))
+  . mapM (\(s, n) -> liftM (, n) $ spanLine txt s)
 
       -- Prefer last of all identically-spanned tokens.  Pretty arbitrary.
-      . map last . groupBy ((==) `on` (\(x,_)->x))
+  . map last . groupBy ((==) `on` (\(x,_)->x))
 
-      -- Extract the labeled spans from the AST.
-      . snd $ getSpans decl)
- 
 srcSpan :: SrcSpanInfo -> (Int, Int)
 srcSpan = (srcSpanStartColumn &&& srcSpanEndColumn) .  srcInfoSpan
 
@@ -116,5 +118,5 @@ getSpan :: (Data a) => a -> Maybe (Int, Int)
 getSpan = listToMaybe . catMaybes . gmapQ (const Nothing `extQ` (Just . srcSpan))
 
 getSpans :: (Data a) => a -> [((Int, Int), String)]
-getSpans x = maybeToList (return . (, show $ toConstr x) =<< getSpan x)
+getSpans x = maybeToList (fmap (, show $ toConstr x) $ getSpan x)
           ++ concat (gmapQ getSpans x)
