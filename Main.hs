@@ -1,20 +1,18 @@
 {-# LANGUAGE FlexibleInstances, TemplateHaskell, 
              TupleSections, TypeOperators #-}
 
-import Control.Arrow ((&&&), first)
+import Control.Arrow ((&&&))
 import Control.Monad (liftM, zipWithM_)
 import Data.Curve
 import Data.Curve.Util (zipT)
 import Data.Data
-import Data.Either
 import Data.Function (on)
 import Data.Generics.Aliases
 import Data.Label
-import Data.List (groupBy, partition)
+import Data.List (groupBy)
 import Data.Maybe
 import Graphics.ToyFramework
 import Language.Haskell.Exts.Annotated
-import qualified Data.Curve.Interval as I
 import qualified Graphics.Rendering.Cairo as C
 
 data State = State
@@ -48,13 +46,13 @@ main = runToy $ Toy
   , tick    = const return
   }
 
-handleKey :: Either [Char] Char -> Bool -> State -> IO State
-handleKey (Right k) True (State xs ix p m) =
+handleKey :: Bool -> Either [Char] Char -> State -> IO State
+handleKey True (Right k) (State xs ix p m) =
   return . updateParse $ State (pre ++ (k : post)) (ix + 1) p m
  where 
   (pre, post) = splitAt ix xs
 
-handleKey (Left k) True s@(State xs ix p m) = liftM updateParse $ (case k of
+handleKey True (Left k) s@(State xs ix p m) = liftM updateParse $ (case k of
     "Left"  -> modM cursor (max 0 . subtract 1)
     "Right" -> modM cursor (min endPos . (+1))
     "Home"  -> setM cursor 0
